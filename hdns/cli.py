@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import ipaddress
 import json
 import os
 import re
@@ -60,15 +61,28 @@ def _fetch_zones(
 def _fetch_all_rrsets(
     client: HetznerDnsClient,
     zones: list[Zone],
-) -> list[tuple[Zone, RRset]]:
+) -> tuple[list[tuple[Zone, RRset]], int]:
+    """Return (pairs, skipped). `skipped` counts zones whose rrset list call
+    raised — surfacing this lets callers exit non-zero on partial data so
+    scripted consumers don't act on truncated output."""
     out: list[tuple[Zone, RRset]] = []
+    skipped = 0
     for z in zones:
         try:
             for rs in client.list_rrsets(z.id):
                 out.append((z, rs))
         except HetznerDnsError as e:
+            skipped += 1
             err_console.print(f"[red]skip zone {z.name}: {e}[/red]")
-    return out
+    return out, skipped
+
+
+def _exit_if_zones_skipped(skipped: int) -> None:
+    if skipped:
+        err_console.print(
+            f"[bold red]{skipped} zone(s) skipped due to list errors — output is incomplete[/bold red]"
+        )
+        sys.exit(2)
 
 
 def zone_filter_option(f):
@@ -377,7 +391,7 @@ def records_list(
         client, zone_glob, label_selector=label_selector,
         ttl=zone_ttl_eq, ttl_min=zone_ttl_min, ttl_max=zone_ttl_max,
     )
-    pairs = _fetch_all_rrsets(client, zs)
+    pairs, skipped = _fetch_all_rrsets(client, zs)
     filtered = [(z, rs) for z, rs in pairs if filter_rrsets(
         [rs], type=types, name_glob=name_glob, value_glob=value_glob, ttl_state=ttl_state,
     )]
@@ -388,43 +402,43 @@ def records_list(
         click.echo(json.dumps([
             {**rs.raw, "zone_name": z.name} for z, rs in filtered
         ], indent=2))
-        return
+    else:
+        # Flatten: one row per (zone, rrset, value) for table/csv.
+        flat: list[tuple[Zone, RRset, str, str]] = []
+        for z, rs in filtered:
+            if not rs.records:
+                flat.append((z, rs, "", ""))
+            for rec in rs.records:
+                flat.append((z, rs, rec.get("value", ""), rec.get("comment", "")))
 
-    # Flatten: one row per (zone, rrset, value) for table/csv.
-    flat: list[tuple[Zone, RRset, str, str]] = []
-    for z, rs in filtered:
-        if not rs.records:
-            flat.append((z, rs, "", ""))
-        for rec in rs.records:
-            flat.append((z, rs, rec.get("value", ""), rec.get("comment", "")))
-
-    if fmt == "csv":
-        writer = csv.writer(sys.stdout, lineterminator="\n")
-        writer.writerow(["zone", "name", "type", "value", "ttl", "ttl_inherited", "rrset_id", "comment"])
-        for z, rs, value, comment in flat:
-            ttl = rs.ttl if rs.ttl is not None else z.ttl
-            inherited = "true" if rs.ttl is None else "false"
-            writer.writerow([z.name, rs.name, rs.type, value, ttl, inherited, rs.id, comment])
-        return
-
-    table = Table(
-        title=f"Records ({len(flat)} values across {len(filtered)} rrsets) "
-              "— TTL marked * is inherited from the zone default",
-    )
-    table.add_column("Zone")
-    table.add_column("Name")
-    table.add_column("Type")
-    table.add_column("Value", overflow="fold")
-    table.add_column("TTL", justify="right")
-    table.add_column("Lock", justify="center")
-    for z, rs, value, _comment in flat:
-        lock = "🔒" if rs.protection_change else ""
-        if rs.ttl is None:
-            ttl_display = f"{z.ttl}[dim]*[/dim]"
+        if fmt == "csv":
+            writer = csv.writer(sys.stdout, lineterminator="\n")
+            writer.writerow(["zone", "name", "type", "value", "ttl", "ttl_inherited", "rrset_id", "comment"])
+            for z, rs, value, comment in flat:
+                ttl = rs.ttl if rs.ttl is not None else z.ttl
+                inherited = "true" if rs.ttl is None else "false"
+                writer.writerow([z.name, rs.name, rs.type, value, ttl, inherited, rs.id, comment])
         else:
-            ttl_display = str(rs.ttl)
-        table.add_row(z.name, rs.name, rs.type, value or "(empty)", ttl_display, lock)
-    console.print(table)
+            table = Table(
+                title=f"Records ({len(flat)} values across {len(filtered)} rrsets) "
+                      "— TTL marked * is inherited from the zone default",
+            )
+            table.add_column("Zone")
+            table.add_column("Name")
+            table.add_column("Type")
+            table.add_column("Value", overflow="fold")
+            table.add_column("TTL", justify="right")
+            table.add_column("Lock", justify="center")
+            for z, rs, value, _comment in flat:
+                lock = "🔒" if rs.protection_change else ""
+                if rs.ttl is None:
+                    ttl_display = f"{z.ttl}[dim]*[/dim]"
+                else:
+                    ttl_display = str(rs.ttl)
+                table.add_row(z.name, rs.name, rs.type, value or "(empty)", ttl_display, lock)
+            console.print(table)
+
+    _exit_if_zones_skipped(skipped)
 
 
 @records.command("set-ttl")
@@ -475,7 +489,7 @@ def records_set_ttl(
         client, zone_glob, label_selector=label_selector,
         ttl=zone_ttl_eq, ttl_min=zone_ttl_min, ttl_max=zone_ttl_max,
     )
-    pairs = _fetch_all_rrsets(client, zs)
+    pairs, skipped = _fetch_all_rrsets(client, zs)
     targets: list[tuple[Zone, RRset]] = []
     locked = 0
     for z, rs in pairs:
@@ -505,15 +519,15 @@ def records_set_ttl(
         for z, rs in targets
     ]
     title = "Set rrset TTL to default" if target_ttl is None else f"Set rrset TTL to {target_ttl}"
-    if not confirm_or_abort(
+    if confirm_or_abort(
         changes,
         title=title,
         dry_run=dry_run,
         assume_yes=assume_yes,
     ):
-        return
-    with AuditLogger(log_file) as audit:
-        _apply_ttl_updates(client, targets, target_ttl, audit)
+        with AuditLogger(log_file) as audit:
+            _apply_ttl_updates(client, targets, target_ttl, audit)
+    _exit_if_zones_skipped(skipped)
 
 
 @records.command("replace-ip")
@@ -555,7 +569,12 @@ def records_replace_ip(
     Within an rrset that has multiple values, only matching values are
     rewritten — the rest are preserved.
     """
+    # Normalize to canonical (compressed, lowercase for IPv6) before matching:
+    # Hetzner stores IPv6 in canonical form, so a user typing "2001:DB8::1"
+    # would otherwise silently miss every record.
     try:
+        old_ip = ipaddress.ip_address(old_ip).compressed
+        new_ip = ipaddress.ip_address(new_ip).compressed
         old_family = classify_ip(old_ip)
         new_family = classify_ip(new_ip)
     except ValueError as e:
@@ -584,7 +603,7 @@ def records_replace_ip(
         client, zone_glob, label_selector=label_selector,
         ttl=zone_ttl_eq, ttl_min=zone_ttl_min, ttl_max=zone_ttl_max,
     )
-    pairs = _fetch_all_rrsets(client, zs)
+    pairs, skipped = _fetch_all_rrsets(client, zs)
     ttl_state = _ttl_state(explicit_ttl, inherited_ttl)
     matched = [(z, rs) for z, rs in pairs if filter_rrsets(
         [rs], type=types, name_glob=name_glob, value_glob=value_glob, ttl_state=ttl_state,
@@ -630,21 +649,20 @@ def records_replace_ip(
     if substring:
         extra = ("Substring mode: matches are bounded by non-IP chars but you should "
                  "still eyeball the diff carefully, especially for TXT records.")
-    if not confirm_or_abort(
+    if confirm_or_abort(
         changes,
         title=f"Replace {old_ip} -> {new_ip}",
         dry_run=dry_run,
         assume_yes=assume_yes,
         extra_warning=extra,
     ):
-        return
-
-    with AuditLogger(log_file) as audit:
-        _apply_records_updates(
-            client,
-            [(z, rs, new_records) for z, rs, new_records, _o, _n in plan],
-            audit,
-        )
+        with AuditLogger(log_file) as audit:
+            _apply_records_updates(
+                client,
+                [(z, rs, new_records) for z, rs, new_records, _o, _n in plan],
+                audit,
+            )
+    _exit_if_zones_skipped(skipped)
 
 
 def _apply_ttl_updates(
