@@ -125,6 +125,8 @@ def zone_filter_option(f):
 def _validate_zone_ttl_filters(eq: int | None, lo: int | None, hi: int | None) -> None:
     if eq is not None and (lo is not None or hi is not None):
         die("--ttl is mutually exclusive with --ttl-min/--ttl-max.")
+    if lo is not None and hi is not None and lo > hi:
+        die(f"--ttl-min ({lo}) is greater than --ttl-max ({hi}); range is empty.")
 
 
 def record_filter_options(f):
@@ -276,10 +278,12 @@ def zones_dump(
             console.print("Aborted.")
             return
     written = 0
+    failed = 0
     for z in zs:
         try:
             content = client.export_zonefile(z.id)
         except HetznerDnsError as e:
+            failed += 1
             err_console.print(f"[red]{z.name}: {e}[/red]")
             continue
         path = out_dir / f"{z.name}.zone"
@@ -287,6 +291,9 @@ def zones_dump(
         written += 1
         console.print(f"[green]wrote[/green] {path}")
     console.print(f"[bold]{written}/{len(zs)} zonefile(s) written to {out_dir}[/bold]")
+    if failed:
+        err_console.print(f"[bold red]{failed} zone(s) failed to export[/bold red]")
+        sys.exit(2)
 
 
 @zones.command("set-ttl")

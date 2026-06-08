@@ -126,10 +126,10 @@ class HetznerDnsClient:
             elapsed_ms,
             len(resp.content or b""),
         )
-        # For mutating verbs, also log the response body so we can confirm what
-        # the API actually accepted (useful when a 200 doesn't mean the field
-        # we sent was honored).
-        if method in ("POST", "PUT", "PATCH", "DELETE") and resp.content:
+        # For mutating verbs that succeeded, log the response body so silent-200
+        # bugs surface (a 200 doesn't always mean the field we sent was
+        # honored). Error bodies are logged once in the error branch below.
+        if method in ("POST", "PUT", "PATCH", "DELETE") and resp.status_code < 300 and resp.content:
             log.debug("response body: %s", resp.text[:1000])
         if resp.status_code >= 300:
             log.debug("response body: %s", resp.text[:1000])
@@ -144,8 +144,12 @@ class HetznerDnsClient:
             return None
         try:
             return resp.json()
-        except ValueError:
-            return resp.text
+        except ValueError as e:
+            raise HetznerDnsError(
+                f"{method} {path} returned non-JSON body when JSON was expected",
+                status=resp.status_code,
+                body=resp.text,
+            ) from e
 
     def iter_zones(
         self,
@@ -195,10 +199,12 @@ class HetznerDnsClient:
     def export_zonefile(self, zone_id: int | str) -> str:
         """Return the BIND-format zonefile string for `zone_id`."""
         data = self._request("GET", f"zones/{zone_id}/zonefile") or {}
-        if isinstance(data, dict) and "zonefile" in data:
-            return data["zonefile"]
-        # Fallback: API returned plain text (shouldn't happen based on probes).
-        return str(data)
+        if "zonefile" not in data:
+            raise HetznerDnsError(
+                f"zonefile response for zone {zone_id} missing 'zonefile' field",
+                body=str(data)[:1000],
+            )
+        return data["zonefile"]
 
     def list_rrsets(self, zone_id: int | str, *, per_page: int = 100) -> list[RRset]:
         out: list[RRset] = []
