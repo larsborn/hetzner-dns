@@ -12,6 +12,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator
+from urllib.parse import urlencode
 
 import requests
 
@@ -120,7 +121,7 @@ class HetznerDnsClient:
             "%s %s%s -> %d (%dms, %dB)",
             method,
             path,
-            f"?{requests.compat.urlencode(params)}" if params else "",
+            f"?{urlencode(params)}" if params else "",
             resp.status_code,
             elapsed_ms,
             len(resp.content or b""),

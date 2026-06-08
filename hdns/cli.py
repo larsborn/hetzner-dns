@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -268,7 +269,7 @@ def zones_dump(
             err_console.print(f"[red]{z.name}: {e}[/red]")
             continue
         path = out_dir / f"{z.name}.zone"
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         written += 1
         console.print(f"[green]wrote[/green] {path}")
     console.print(f"[bold]{written}/{len(zs)} zonefile(s) written to {out_dir}[/bold]")
@@ -310,6 +311,7 @@ def zones_set_ttl(
     ):
         return
     ok = 0
+    failed = 0
     with AuditLogger(log_file) as audit:
         for z in targets:
             try:
@@ -329,6 +331,7 @@ def zones_set_ttl(
                     result="ok",
                 )
             except HetznerDnsError as e:
+                failed += 1
                 err_console.print(f"[red]{z.name}: {e} ({e.body or ''})[/red]")
                 audit.record(
                     "zones.set-ttl",
@@ -340,6 +343,9 @@ def zones_set_ttl(
                     error=str(e),
                 )
     console.print(f"[bold]{ok}/{len(changes)} zone ttl action(s) submitted (async)[/bold]")
+    if failed:
+        err_console.print(f"[bold red]{failed} zone ttl action(s) failed to submit[/bold red]")
+        sys.exit(2)
 
 
 @main.group()
@@ -377,8 +383,10 @@ def records_list(
     )]
 
     if fmt == "json":
+        # `rs.raw["zone"]` is the integer zone ID from the API; expose the
+        # friendly name under a distinct key so we don't clobber it.
         click.echo(json.dumps([
-            {"zone": z.name, **rs.raw} for z, rs in filtered
+            {**rs.raw, "zone_name": z.name} for z, rs in filtered
         ], indent=2))
         return
 
@@ -391,11 +399,12 @@ def records_list(
             flat.append((z, rs, rec.get("value", ""), rec.get("comment", "")))
 
     if fmt == "csv":
-        click.echo("zone,name,type,value,ttl,ttl_inherited,rrset_id,comment")
+        writer = csv.writer(sys.stdout, lineterminator="\n")
+        writer.writerow(["zone", "name", "type", "value", "ttl", "ttl_inherited", "rrset_id", "comment"])
         for z, rs, value, comment in flat:
             ttl = rs.ttl if rs.ttl is not None else z.ttl
             inherited = "true" if rs.ttl is None else "false"
-            click.echo(f"{z.name},{rs.name},{rs.type},{value},{ttl},{inherited},{rs.id},{comment}")
+            writer.writerow([z.name, rs.name, rs.type, value, ttl, inherited, rs.id, comment])
         return
 
     table = Table(
